@@ -85,7 +85,7 @@ export default class PlayerStateTracker {
         let coverData = await Resources.getImageData(track.metadata.image_xlarge_url);
 
         if (config.saveLyrics || config.embedLyrics) {
-            let lyrics = await this.getLyrics(track);
+            let lyrics = await this.getLyrics(playback);
 
             if (lyrics && config.embedLyrics) {
                 let text = lyrics.text;
@@ -204,41 +204,33 @@ export default class PlayerStateTracker {
             explicit:       meta.explicit ? "1" : undefined
         };
     }
-    private async getLyrics(track: TrackInfo) {
-        let lyrics;
+    private async getLyrics(playback: PlayerState) {
+        let track = playback.item;
+
+        if (track.type !== "track") {
+            console.info("Skipping lyrics for non-track content: %s", track.uri);
+            return null;
+        }
+        if (playback.context?.uri?.startsWith("spotify:dj")) {
+            console.info("Skipping lyrics while DJ mode is active for %s", track.uri);
+            return null;
+        }
+        if (navigator && navigator.onLine === false) {
+            console.info("Skipping lyrics fetch while offline for %s", track.uri);
+            return null;
+        }
 
         try {
-            if (track.metadata.has_lyrics === "true") {
-                let resp = await Resources.getColorAndLyricsWG(track.uri, track.metadata.image_url);
-                lyrics = resp.lyrics;
+            let result = await Resources.getSpicyLyrics(track.uri);
+            if (!result.ok) {
+                console.info("Lyrics unavailable for %s: %s", track.uri, result.reason);
+                return null;
             }
+            return result.lyrics;
         } catch (ex) {
-            //has_lyrics seems to be wrong sometimes
             console.error("Failed to fetch lyrics for %s: %s", track.uri, ex);
+            return null;
         }
-        if (!lyrics) return null;
-
-        let isSynced = ["LINE_SYNCED", "SYLLABLE_SYNCED"].includes(lyrics.syncType);
-
-        let text = "";
-        for (let line of lyrics.lines) {
-            //skip empty lines
-            if (!isSynced && /^(|♪)$/.test(line.words)) continue;
-
-            if (isSynced) {
-                //https://en.wikipedia.org/wiki/LRC_(file_format)#Simple_format
-                //https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/lrcdec.c#L88
-                //(number of digits doesn't seem to matter)
-                let time = parseInt(line.startTimeMs);
-                let mm = Utils.padInt(time / 1000 / 60, 2);
-                let ss = Utils.padInt(time / 1000 % 60, 2);
-                let cs = Utils.padInt(time % 1000 / 10, 2);
-                text += `[${mm}:${ss}.${cs}]`;
-            }
-            text += line.words;
-            text += '\n';
-        }
-        return { text: text, rawData: lyrics, isSynced: isSynced };
     }
 
     private async skipIgnoredTracks(queue: any, statusCache: Map<string, boolean>) {
