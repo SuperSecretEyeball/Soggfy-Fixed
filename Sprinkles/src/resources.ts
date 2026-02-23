@@ -1,4 +1,9 @@
-import { Platform, SpotifyUtils, WebAPI } from "./spotify-apis";
+import { CosmosAsync, Platform, SpotifyUtils, WebAPI } from "./spotify-apis";
+import { getNoLyricsSentinel, isNoLyricsSentinel, parseSpicyLyricsPayload } from "./lyrics-utils";
+
+const SPICY_LYRICS_CACHE_KEY = "SpicyLyrics_LyricsStore";
+const CURRENT_LYRICS_DATA_KEY = "currentLyricsData";
+const SPICY_LYRICS_CACHE_DAYS = 3;
 
 class Resources {
     static getTrackMetadataWG(uri: string): Promise<TrackMetadataWG> {
@@ -18,6 +23,97 @@ class Resources {
     }
     static async getEpisodeMetadata(uri: string) {
         return await WebAPI.getEpisode(this.getUriId(uri, "episode"));
+    }
+
+    static async getSpicyLyrics(trackUri: string, clientVersion = "unknown") {
+        let trackId = this.getUriId(trackUri, "track");
+
+        let currentLyricsData = this.readCurrentLyricsData();
+        if (currentLyricsData?.trackId === trackId) {
+            if (isNoLyricsSentinel(currentLyricsData.lyrics, trackId)) {
+                return { ok: false, reason: "lyrics-not-found", fromCache: true };
+            }
+            if (currentLyricsData.lyrics) {
+                return { ok: true, lyrics: currentLyricsData.lyrics, fromCache: true };
+            }
+        }
+
+        let cacheStore = this.readLyricsStore();
+        let cachedEntry = cacheStore?.[trackId];
+        if (cachedEntry && cachedEntry.expiresAt > Date.now()) {
+            if (isNoLyricsSentinel(cachedEntry.lyrics, trackId)) {
+                this.writeCurrentLyricsData(trackId, cachedEntry.lyrics);
+                return { ok: false, reason: "lyrics-not-found", fromCache: true };
+            }
+
+            this.writeCurrentLyricsData(trackId, cachedEntry.lyrics);
+            return { ok: true, lyrics: cachedEntry.lyrics, fromCache: true };
+        }
+
+        let token = await this.getSpotifyAccessToken();
+        if (!token) {
+            throw Error("Failed to fetch Spotify access token for lyrics request.");
+        }
+
+        const body = {
+            queries: [{
+                operation: "lyrics",
+                variables: {
+                    id: trackId,
+                    auth: "SpicyLyrics-WebAuth"
+                }
+            }],
+            client: {
+                version: clientVersion || "unknown"
+            }
+        };
+
+        let response = await this.fetchWithRetry("https://api.spicylyrics.org/query", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "SpicyLyrics-Version": clientVersion || "unknown",
+                "SpicyLyrics-WebAuth": `Bearer ${token}`
+            },
+            body: JSON.stringify(body)
+        });
+
+        let payload: any;
+        try {
+            payload = await response.json();
+        } catch (ex) {
+            throw Error(`Spicy Lyrics returned non-JSON response: ${ex}`);
+        }
+
+        let result = payload?.queries?.[0]?.result;
+        if (!result) {
+            throw Error("Spicy Lyrics response missing query result.");
+        }
+
+        if (result.httpStatus === 404) {
+            let sentinel = getNoLyricsSentinel(trackId).value;
+            this.writeCurrentLyricsData(trackId, sentinel);
+            this.writeLyricsStore(trackId, sentinel);
+            return { ok: false, reason: "lyrics-not-found", status: 404, fromCache: false };
+        }
+        if (result.httpStatus !== 200) {
+            return { ok: false, reason: "status-not-200", status: result.httpStatus, fromCache: false };
+        }
+        if (result.format !== "json") {
+            return { ok: false, reason: "unexpected-format", format: result.format, fromCache: false };
+        }
+        if (!result.data) {
+            return { ok: false, reason: "empty-lyrics", fromCache: false };
+        }
+
+        let lyrics = parseSpicyLyricsPayload(result.data);
+        this.writeCurrentLyricsData(trackId, lyrics);
+        this.writeLyricsStore(trackId, lyrics);
+        return {
+            ok: true,
+            lyrics,
+            fromCache: false
+        };
     }
 
     static async getPlaylistTracks(uri: string, sorted = true) {
@@ -136,6 +232,67 @@ class Resources {
             throw Error(`fetch("${url.toString()}") failed: ${resp.statusText}`);
         }
         return await resp.arrayBuffer();
+    }
+
+    private static async fetchWithRetry(url: string, init: RequestInit, retries = 3) {
+        let delay = 250;
+        let lastError = null;
+
+        for (let attempt = 0; attempt < retries; attempt++) {
+            try {
+                let response = await fetch(url, init);
+                if (response.status >= 500 || response.status === 429) {
+                    throw Error(`Transient lyrics request failure: ${response.status}`);
+                }
+                if (!response.ok) {
+                    throw Error(`Failed lyrics request: ${response.status} ${response.statusText}`);
+                }
+                return response;
+            } catch (ex) {
+                lastError = ex;
+                if (attempt === retries - 1) break;
+                await new Promise(resolve => setTimeout(resolve, delay));
+                delay *= 2;
+            }
+        }
+        throw lastError;
+    }
+
+    private static async getSpotifyAccessToken() {
+        let tokenData = await Platform?.GetSpotifyAccessToken?.();
+        tokenData ??= await Platform?.getSpotifyAccessToken?.();
+
+        if (!tokenData?.accessToken) {
+            tokenData = await CosmosAsync.get("sp://oauth/v2/token");
+        }
+        return tokenData?.accessToken ?? Platform?.Session?.accessToken;
+    }
+
+    private static readCurrentLyricsData() {
+        try {
+            return JSON.parse(localStorage.getItem(CURRENT_LYRICS_DATA_KEY));
+        } catch {
+            return null;
+        }
+    }
+    private static writeCurrentLyricsData(trackId: string, lyrics: any) {
+        localStorage.setItem(CURRENT_LYRICS_DATA_KEY, JSON.stringify({ trackId, lyrics }));
+    }
+
+    private static readLyricsStore() {
+        try {
+            return JSON.parse(localStorage.getItem(SPICY_LYRICS_CACHE_KEY)) ?? {};
+        } catch {
+            return {};
+        }
+    }
+    private static writeLyricsStore(trackId: string, lyrics: any) {
+        let store = this.readLyricsStore();
+        store[trackId] = {
+            lyrics,
+            expiresAt: Date.now() + SPICY_LYRICS_CACHE_DAYS * 24 * 60 * 60 * 1000
+        };
+        localStorage.setItem(SPICY_LYRICS_CACHE_KEY, JSON.stringify(store));
     }
 
     static getOpenTrackURL(uri: string) {
