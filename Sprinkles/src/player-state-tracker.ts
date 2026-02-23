@@ -4,6 +4,7 @@ import Resources from "./resources";
 import config, { isTrackIgnored } from "./config";
 import { PathTemplate, TemplatedSearchTree } from "./path-template";
 import { Connection, MessageType } from "./connection";
+import { parseSpicyLyricsPayload } from "./lyrics-utils";
 
 export default class PlayerStateTracker {
     private playbacks = new Map<string, PlayerState>();
@@ -205,40 +206,39 @@ export default class PlayerStateTracker {
         };
     }
     private async getLyrics(track: TrackInfo) {
-        let lyrics;
+        if (track.type !== "track") {
+            console.info("Skipping lyrics for non-track content: %s", track.uri);
+            return null;
+        }
+        if (track.metadata?.media_type && track.metadata.media_type !== "audio") {
+            console.info("Skipping lyrics for non-audio media: %s", track.uri);
+            return null;
+        }
+        if (typeof navigator !== "undefined" && navigator.onLine === false) {
+            console.info("Skipping lyrics fetch while offline: %s", track.uri);
+            return null;
+        }
 
+        let trackId = Resources.getUriId(track.uri, "track");
         try {
-            if (track.metadata.has_lyrics === "true") {
-                let resp = await Resources.getColorAndLyricsWG(track.uri, track.metadata.image_url);
-                lyrics = resp.lyrics;
+            let resp = await Resources.getSpicyLyricsForTrack(trackId);
+            if ("noLyrics" in resp && resp.noLyrics) {
+                console.info("No lyrics found for %s (%s)", track.uri, resp.reason ?? "no-lyrics");
+                return null;
             }
+            if (!("lyrics" in resp)) {
+                return null;
+            }
+            let parsed = parseSpicyLyricsPayload(resp.lyrics);
+            if (!parsed) {
+                console.error("Malformed lyrics payload for %s", track.uri);
+                return null;
+            }
+            return parsed;
         } catch (ex) {
-            //has_lyrics seems to be wrong sometimes
             console.error("Failed to fetch lyrics for %s: %s", track.uri, ex);
+            return null;
         }
-        if (!lyrics) return null;
-
-        let isSynced = ["LINE_SYNCED", "SYLLABLE_SYNCED"].includes(lyrics.syncType);
-
-        let text = "";
-        for (let line of lyrics.lines) {
-            //skip empty lines
-            if (!isSynced && /^(|♪)$/.test(line.words)) continue;
-
-            if (isSynced) {
-                //https://en.wikipedia.org/wiki/LRC_(file_format)#Simple_format
-                //https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/lrcdec.c#L88
-                //(number of digits doesn't seem to matter)
-                let time = parseInt(line.startTimeMs);
-                let mm = Utils.padInt(time / 1000 / 60, 2);
-                let ss = Utils.padInt(time / 1000 % 60, 2);
-                let cs = Utils.padInt(time % 1000 / 10, 2);
-                text += `[${mm}:${ss}.${cs}]`;
-            }
-            text += line.words;
-            text += '\n';
-        }
-        return { text: text, rawData: lyrics, isSynced: isSynced };
     }
 
     private async skipIgnoredTracks(queue: any, statusCache: Map<string, boolean>) {

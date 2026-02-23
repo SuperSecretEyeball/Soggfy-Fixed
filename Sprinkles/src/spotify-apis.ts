@@ -140,5 +140,6 @@ export interface TrackInfo {
         has_lyrics: string,
         album_uri: string,
         is_explicit?: string;
+        media_type?: string;
     }
 }
